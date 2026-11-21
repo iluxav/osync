@@ -1,6 +1,6 @@
 // Package daemon wires the pieces into the running service: the mesh of peer
-// connections, the clipboard sync engine, and the control socket that the
-// status command reads.
+// connections, the clipboard sync engine, the files that travel with it, and
+// the control socket that the status command reads.
 package daemon
 
 import (
@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/iluxav/osync/internal/bundle"
 	"github.com/iluxav/osync/internal/clipboard"
 	"github.com/iluxav/osync/internal/clipsync"
 	"github.com/iluxav/osync/internal/mesh"
@@ -31,6 +32,7 @@ type Config struct {
 	Version   string
 	Port      int
 	Socket    string // path of the control socket
+	Files     string // folder for files from other machines; empty to sync text only
 	Tailnet   tailnet.Source
 	Clipboard clipboard.Clipboard
 	Log       *slog.Logger
@@ -44,6 +46,7 @@ type Status struct {
 	Started   time.Time      `json:"started"`
 	Mesh      mesh.Status    `json:"mesh"`
 	Clipboard clipsync.Stats `json:"clipboard"`
+	Files     FileStats      `json:"files"`
 }
 
 // message is what peers exchange. Type names the kind; unknown kinds are
@@ -51,6 +54,8 @@ type Status struct {
 type message struct {
 	Type string `json:"type"`
 	clipsync.Clip
+	// What the bundle holds, in a "files" message. See fileSync.
+	bundle.Summary
 }
 
 // DefaultSocket returns where the control socket lives for the current user.
@@ -60,6 +65,17 @@ func DefaultSocket() string {
 	}
 	// macOS: TMPDIR is already private to the user.
 	return filepath.Join(os.TempDir(), fmt.Sprintf("osync-%d.sock", os.Getuid()))
+}
+
+// DefaultFiles returns where files from other machines are kept for the
+// current user. They are copies that pasting copies again, so they belong
+// with the caches.
+func DefaultFiles() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "osync", "files")
 }
 
 // Run runs the daemon until ctx is done or a part of it fails.
@@ -73,30 +89,36 @@ func Run(ctx context.Context, cfg Config) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	files := &fileSync{log: cfg.Log}
+	if cfg.Files != "" {
+		if files.inbox, err = bundle.OpenInbox(cfg.Files); err != nil {
+			// Text needs no inbox, so it is still synced.
+			cfg.Log.Error("files will not be synced", "err", err)
+		}
+	}
 	var engine *clipsync.Engine
 	m := mesh.New(mesh.Config{
 		Port:    cfg.Port,
 		Tailnet: cfg.Tailnet,
 		Log:     cfg.Log,
 		Poll:    cfg.Poll,
-		Receive: func(from tailnet.Node, payload []byte) {
-			var msg message
-			if err := json.Unmarshal(payload, &msg); err != nil {
-				cfg.Log.Warn("unreadable message", "peer", from.Name, "err", err)
-				return
-			}
-			if msg.Type == "clip" {
-				engine.Remote(ctx, msg.Clip)
-			}
+		Connect: func(peer tailnet.Node) mesh.Handler {
+			return &session{ctx: ctx, peer: peer, engine: engine, files: files, log: cfg.Log}
 		},
 	})
-	engine = clipsync.New(cfg.Clipboard, func(clip clipsync.Clip) {
+	files.mesh = m
+	engine = clipsync.New(cfg.Clipboard, func(clip clipsync.Clip, c clipboard.Content) bool {
+		if len(c.Files) > 0 {
+			return files.send(clip, c.Files)
+		}
 		payload, err := json.Marshal(message{Type: "clip", Clip: clip})
 		if err != nil {
 			cfg.Log.Error("cannot encode clip", "err", err)
-			return
+			return false
 		}
 		m.Broadcast(payload)
+		files.superseded()
+		return true
 	}, cfg.Log)
 
 	started := time.Now()
@@ -109,6 +131,7 @@ func Run(ctx context.Context, cfg Config) error {
 			Started:   started,
 			Mesh:      m.Status(),
 			Clipboard: engine.Stats(),
+			Files:     files.snapshot(),
 		})
 	})
 	srv := &http.Server{Handler: mux}

@@ -1,5 +1,5 @@
-// osync shares the clipboard between a person's Linux and macOS
-// machines over their Tailscale network.
+// osync shares the clipboard, text and copied files, between a person's Linux
+// and macOS machines over their Tailscale network.
 package main
 
 import (
@@ -82,6 +82,7 @@ func runDaemon(args []string) error {
 		Version:   version,
 		Port:      *port,
 		Socket:    daemon.DefaultSocket(),
+		Files:     daemon.DefaultFiles(),
 		Tailnet:   &tailnet.CLI{},
 		Clipboard: cb,
 		Log:       log,
@@ -131,6 +132,12 @@ func printStatus(out io.Writer, st daemon.Status, now time.Time) {
 	c := st.Clipboard
 	fmt.Fprintf(out, "Clipboard:  %d sent%s, %d received%s\n",
 		c.Sent, ago(now, c.LastSent), c.Received, ago(now, c.LastReceived))
+	// Copies of files are counted above too; this line is about them alone.
+	if f := st.Files; f.Problem != "" {
+		fmt.Fprintf(out, "Files:      %d sent, %d received; %s\n", f.Sent, f.Received, f.Problem)
+	} else {
+		fmt.Fprintf(out, "Files:      %d sent, %d received\n", f.Sent, f.Received)
+	}
 
 	fmt.Fprintln(out)
 	if m.Note != "" {

@@ -5,29 +5,36 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"slices"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/iluxav/osync/internal/clipboard"
 )
 
 // board is a clipboard that records writes and can be made to fail.
 type board struct {
 	text   string
-	writes []string
+	files  []string
+	writes []string // what was written; files as their paths joined by commas
 	fail   bool
 }
 
-func (b *board) Read(context.Context) (string, error) { return b.text, nil }
+func (b *board) Read(context.Context) (clipboard.Content, error) {
+	return clipboard.Content{Text: b.text, Files: b.files}, nil
+}
 
-func (b *board) Write(_ context.Context, text string) error {
+func (b *board) Write(_ context.Context, c clipboard.Content) error {
 	if b.fail {
 		return errors.New("no display")
 	}
-	b.text = text
-	b.writes = append(b.writes, text)
+	b.text, b.files = c.Text, c.Files
+	b.writes = append(b.writes, c.Text+strings.Join(c.Files, ","))
 	return nil
 }
 
-func (b *board) Watch(ctx context.Context, _ func(string)) error {
+func (b *board) Watch(ctx context.Context, _ func(clipboard.Content)) error {
 	<-ctx.Done()
 	return ctx.Err()
 }
@@ -35,14 +42,24 @@ func (b *board) Watch(ctx context.Context, _ func(string)) error {
 // rig is an Engine with a clock the test moves and a record of what it sent.
 type rig struct {
 	*Engine
-	board *board
-	sent  []Clip
-	clock time.Time
+	board      *board
+	sent       []Clip
+	sentFiles  [][]string // the files each sent clip stood for; nil for text
+	unsendable bool       // send refuses, as it does for files over the limit
+	clock      time.Time
 }
 
 func newRig(origin string) *rig {
 	r := &rig{board: &board{}, clock: time.UnixMilli(1_000_000)}
-	r.Engine = New(r.board, func(c Clip) { r.sent = append(r.sent, c) }, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	send := func(c Clip, content clipboard.Content) bool {
+		if r.unsendable {
+			return false
+		}
+		r.sent = append(r.sent, c)
+		r.sentFiles = append(r.sentFiles, content.Files)
+		return true
+	}
+	r.Engine = New(r.board, send, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	r.Engine.origin = origin
 	r.Engine.now = func() time.Time { return r.clock }
 	return r
@@ -53,13 +70,21 @@ func (r *rig) advance(d time.Duration) { r.clock = r.clock.Add(d) }
 // copy acts as the user copying text: it lands on the clipboard and the
 // watcher reports it.
 func (r *rig) copy(text string) {
-	r.board.text = text
+	r.board.text, r.board.files = text, nil
 	r.report(text)
 }
 
 // report acts as the watcher reporting text, which may or may not still be
 // what the clipboard holds.
-func (r *rig) report(text string) { r.local(ctx, text) }
+func (r *rig) report(text string) { r.local(ctx, clipboard.Content{Text: text}) }
+
+// copyFiles acts as the user copying files in a file manager.
+func (r *rig) copyFiles(paths ...string) {
+	r.board.text, r.board.files = "", paths
+	r.reportFiles(paths...)
+}
+
+func (r *rig) reportFiles(paths ...string) { r.local(ctx, clipboard.Content{Files: paths}) }
 
 var ctx = context.Background()
 
@@ -222,5 +247,109 @@ func TestCopyRightAfterARemoteWriteIsSent(t *testing.T) {
 	r.report("local")
 	if len(r.sent) != 1 || r.sent[0].Text != "local" || r.sent[0].Stamp <= 5_000_000 {
 		t.Errorf("sent = %+v, want 'local' stamped after the remote clip", r.sent)
+	}
+}
+
+func TestCopiedFilesAreSentWithoutText(t *testing.T) {
+	r := newRig("a")
+	r.copyFiles("/home/me/report.pdf", "/home/me/photos")
+	if len(r.sent) != 1 || r.sent[0].Text != "" || r.sent[0].Origin != "a" {
+		t.Fatalf("sent = %+v, want one clip without text", r.sent)
+	}
+	if want := []string{"/home/me/report.pdf", "/home/me/photos"}; !slices.Equal(r.sentFiles[0], want) {
+		t.Errorf("the clip stood for %q, want %q", r.sentFiles[0], want)
+	}
+}
+
+func TestReceivedFilesAreWrittenAndTheirEchoIsNotSentBack(t *testing.T) {
+	r := newRig("b")
+	if !r.RemoteFiles(ctx, Clip{Stamp: 5_000_000, Origin: "a"}, []string{"/inbox/1/report.pdf"}) {
+		t.Fatal("RemoteFiles = false, want the clip adopted")
+	}
+	if len(r.board.writes) != 1 || r.board.writes[0] != "/inbox/1/report.pdf" {
+		t.Fatalf("writes = %q, want the received file", r.board.writes)
+	}
+	r.reportFiles("/inbox/1/report.pdf")
+	r.advance(time.Hour)
+	r.reportFiles("/inbox/1/report.pdf")
+	if len(r.sent) != 0 {
+		t.Errorf("sent = %+v, want nothing: these files came from a peer", r.sent)
+	}
+}
+
+func TestFilesAndTextFollowTheSameOrder(t *testing.T) {
+	r := newRig("b")
+	r.copy("mine") // stamp 1_000_000
+	if r.RemoteFiles(ctx, Clip{Stamp: 999_999, Origin: "a"}, []string{"/inbox/1/old.txt"}) {
+		t.Error("files older than the local copy were adopted")
+	}
+	if !r.RemoteFiles(ctx, Clip{Stamp: 1_000_001, Origin: "a"}, []string{"/inbox/2/new.txt"}) {
+		t.Error("files newer than the local copy were not adopted")
+	}
+	if !r.Remote(ctx, Clip{Stamp: 1_000_002, Origin: "a", Text: "text after files"}) {
+		t.Error("text newer than the files was not adopted")
+	}
+	if want := []string{"/inbox/2/new.txt", "text after files"}; !slices.Equal(r.board.writes, want) {
+		t.Errorf("writes = %q, want %q", r.board.writes, want)
+	}
+}
+
+// Files take time to arrive. A copy made here while they are on their way
+// is the newer one, and must stay ahead of them.
+func TestCopyMadeWhileFilesArriveWins(t *testing.T) {
+	r := newRig("b")
+	// A peer whose clock runs an hour ahead starts sending files.
+	future := Clip{Stamp: uint64(r.clock.Add(time.Hour).UnixMilli()), Origin: "a"}
+	if !r.Expect(future) {
+		t.Fatal("Expect = false, want the files wanted: nothing newer is held")
+	}
+	r.copy("copied meanwhile")
+	if len(r.sent) != 1 || r.sent[0].Stamp <= future.Stamp {
+		t.Fatalf("sent = %+v, want a stamp past the files' %d", r.sent, future.Stamp)
+	}
+	if r.RemoteFiles(ctx, future, []string{"/inbox/1/late.bin"}) {
+		t.Error("the files were adopted over the newer local copy")
+	}
+	if r.Expect(future) {
+		t.Error("Expect = true for a clip older than what is held")
+	}
+}
+
+func TestCopyThatCannotBeSentLeavesNoTrace(t *testing.T) {
+	r := newRig("b")
+	r.unsendable = true
+	r.copyFiles("/home/me/huge.iso")
+	if s := r.Stats(); s.Sent != 0 {
+		t.Errorf("stats = %+v, want nothing counted as sent", s)
+	}
+	// A peer whose clock is a little behind copies next. Had the unsent
+	// copy been adopted, it would outrank this clip here and nowhere else.
+	if !r.Remote(ctx, Clip{Stamp: 999_000, Origin: "a", Text: "from a"}) {
+		t.Error("a peer's clip lost to a copy that was never sent")
+	}
+}
+
+func TestCopyingTheSameFilesAgain(t *testing.T) {
+	r := newRig("a")
+	r.copyFiles("/home/me/draft.txt")
+	r.reportFiles("/home/me/draft.txt") // re-announced moments later
+	if len(r.sent) != 1 {
+		t.Fatalf("sent %d clips, want 1: the repeat is a duplicate event", len(r.sent))
+	}
+	// The user edits the file and copies it again: same path, new content.
+	r.advance(echoWindow + time.Second)
+	r.copyFiles("/home/me/draft.txt")
+	if len(r.sent) != 2 {
+		t.Fatalf("sent %d clips, want 2: the file may have changed", len(r.sent))
+	}
+}
+
+func TestTextThatSpellsAPathIsNotMistakenForTheFile(t *testing.T) {
+	r := newRig("b")
+	r.RemoteFiles(ctx, Clip{Stamp: 5_000_000, Origin: "a"}, []string{"/inbox/1/a.txt"})
+	// The user copies the path as text. That is a new copy, not an echo.
+	r.copy("/inbox/1/a.txt")
+	if len(r.sent) != 1 || r.sent[0].Text != "/inbox/1/a.txt" {
+		t.Errorf("sent = %+v, want the text sent", r.sent)
 	}
 }

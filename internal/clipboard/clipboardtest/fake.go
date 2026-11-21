@@ -4,42 +4,56 @@ package clipboardtest
 import (
 	"context"
 	"sync"
+
+	"github.com/iluxav/osync/internal/clipboard"
 )
 
-// Fake is an in-memory clipboard. Like a real one, it reports text placed by
-// Write back through Watch, asynchronously.
+// Fake is an in-memory clipboard. Like a real one, it reports content placed
+// by Write back through Watch, asynchronously.
 type Fake struct {
-	events chan string
+	events chan clipboard.Content
 
-	mu     sync.Mutex
-	text   string
-	writes int
+	mu      sync.Mutex
+	content clipboard.Content
+	writes  int
 }
 
 // New returns an empty Fake.
-func New() *Fake { return &Fake{events: make(chan string, 256)} }
+func New() *Fake { return &Fake{events: make(chan clipboard.Content, 256)} }
 
 // Copy acts as the user copying text on this machine.
-func (f *Fake) Copy(text string) {
+func (f *Fake) Copy(text string) { f.set(clipboard.Content{Text: text}) }
+
+// CopyFiles acts as the user copying files or folders in a file manager.
+func (f *Fake) CopyFiles(paths ...string) { f.set(clipboard.Content{Files: paths}) }
+
+func (f *Fake) set(c clipboard.Content) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.text = text
-	f.events <- text // under the lock: events arrive in the order content changed
+	f.content = c
+	f.events <- c // under the lock: events arrive in the order content changed
 }
 
 // CopyPrivate acts as the user copying something that is never synced, such
 // as a password: the content changes but Watch stays silent.
 func (f *Fake) CopyPrivate(text string) {
 	f.mu.Lock()
-	f.text = text
+	f.content = clipboard.Content{Text: text}
 	f.mu.Unlock()
 }
 
-// Text returns the current content.
+// Text returns the text on the clipboard, which is empty while it holds files.
 func (f *Fake) Text() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.text
+	return f.content.Text
+}
+
+// Files returns the files on the clipboard.
+func (f *Fake) Files() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.content.Files
 }
 
 // Writes returns how many times Write was called.
@@ -50,28 +64,30 @@ func (f *Fake) Writes() int {
 }
 
 // Read implements clipboard.Clipboard.
-func (f *Fake) Read(context.Context) (string, error) {
-	return f.Text(), nil
+func (f *Fake) Read(context.Context) (clipboard.Content, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.content, nil
 }
 
 // Write implements clipboard.Clipboard.
-func (f *Fake) Write(_ context.Context, text string) error {
+func (f *Fake) Write(_ context.Context, c clipboard.Content) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.text = text
+	f.content = c
 	f.writes++
-	f.events <- text
+	f.events <- c
 	return nil
 }
 
 // Watch implements clipboard.Clipboard.
-func (f *Fake) Watch(ctx context.Context, onText func(string)) error {
+func (f *Fake) Watch(ctx context.Context, onCopy func(clipboard.Content)) error {
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case text := <-f.events:
-			onText(text)
+		case c := <-f.events:
+			onCopy(c)
 		}
 	}
 }

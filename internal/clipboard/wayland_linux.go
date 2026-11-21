@@ -13,13 +13,19 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
-// The one MIME type that is watched. Asking wl-paste for it by its exact name
-// means the watcher only fires for plain text; an image copied from a browser
-// also offers text/html, which a looser "any text" match would hand over.
-const textType = "text/plain;charset=utf-8"
+const (
+	// The one text type that is watched. Asking wl-paste for it by its exact
+	// name means the watcher only fires for plain text; an image copied from
+	// a browser also offers text/html, which a looser "any text" match would
+	// hand over.
+	textType = "text/plain;charset=utf-8"
+	// What file managers offer for copied files: one file:// URI per line.
+	filesType = "text/uri-list"
+)
 
 // watchScript is run by wl-paste for every clipboard change, with the new
 // content on stdin. It prints one line: the state wl-paste reports, a space,
@@ -58,21 +64,49 @@ func (w *wayland) args(args ...string) []string {
 	return args
 }
 
-func (w *wayland) Read(ctx context.Context) (string, error) {
+func (w *wayland) Read(ctx context.Context) (Content, error) {
+	if files := w.readFiles(ctx); len(files) > 0 {
+		return Content{Files: files}, nil
+	}
+	text, err := w.readType(ctx, textType)
+	if err != nil {
+		return Content{}, err
+	}
+	return Content{Text: text}, nil
+}
+
+// readType returns the clipboard content in one of the types it is offered in.
+func (w *wayland) readType(ctx context.Context, typ string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, toolTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "wl-paste", w.args("--no-newline", "--type", textType)...).Output()
+	out, err := exec.CommandContext(ctx, "wl-paste", w.args("--no-newline", "--type", typ)...).Output()
 	if err != nil {
 		return "", fmt.Errorf("wl-paste: %w", err)
 	}
 	return string(out), nil
 }
 
-func (w *wayland) Write(ctx context.Context, text string) error {
+// readFiles returns the files on the clipboard, or nil when it holds
+// something else.
+func (w *wayland) readFiles(ctx context.Context) []string {
+	list, err := w.readType(ctx, filesType)
+	if err != nil {
+		return nil
+	}
+	return parseURIList(list)
+}
+
+func (w *wayland) Write(ctx context.Context, c Content) error {
+	typ, data := "text/plain", c.Text
+	if len(c.Files) > 0 {
+		// wl-copy offers any text/ type as plain text too, so the files
+		// paste into a file manager and their URIs into a text field.
+		typ, data = filesType, uriList(c.Files)
+	}
 	ctx, cancel := context.WithTimeout(ctx, toolTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "wl-copy", w.args("--type", "text/plain")...)
-	cmd.Stdin = strings.NewReader(text)
+	cmd := exec.CommandContext(ctx, "wl-copy", w.args("--type", typ)...)
+	cmd.Stdin = strings.NewReader(data)
 	// Stdout and Stderr stay unset on purpose. wl-copy forks a process that
 	// serves the clipboard until the next copy and keeps stderr open; given a
 	// pipe there, Run would wait for that process instead of returning.
@@ -82,42 +116,43 @@ func (w *wayland) Write(ctx context.Context, text string) error {
 	return nil
 }
 
-func (w *wayland) Watch(ctx context.Context, onText func(string)) error {
-	delay := time.Second
-	for {
-		started := time.Now()
-		err := w.watchOnce(ctx, onText)
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if errors.Is(err, errTooOld) {
-			// Restarting cannot fix this. Clips from other machines still
-			// arrive, so stay up rather than fail.
-			w.log.Error("clipboard is not watched", "err", err)
-			<-ctx.Done()
-			return ctx.Err()
-		}
-		if time.Since(started) > time.Minute {
-			delay = time.Second
-		}
-		w.log.Warn("clipboard watcher stopped, restarting", "err", err, "in", delay)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(delay):
-		}
-		delay = min(2*delay, time.Minute)
+func (w *wayland) Watch(ctx context.Context, onCopy func(Content)) error {
+	// The two watchers report through one door, so calls never overlap.
+	var mu sync.Mutex
+	report := func(c Content) {
+		mu.Lock()
+		defer mu.Unlock()
+		onCopy(c)
 	}
+	// One watcher per type: wl-paste hands over state and content together
+	// only for the type it was told to watch.
+	var wg sync.WaitGroup
+	for _, typ := range []string{textType, filesType} {
+		wg.Go(func() {
+			keepRunning(ctx, w.log, "clipboard watcher for "+typ, func() error {
+				err := w.watchOnce(ctx, typ, report)
+				if errors.Is(err, errTooOld) && ctx.Err() == nil {
+					// Restarting cannot fix this. Clips from other machines
+					// still arrive, so stay up rather than fail.
+					w.log.Error("clipboard is not watched", "type", typ, "err", err)
+					<-ctx.Done()
+				}
+				return err
+			})
+		})
+	}
+	wg.Wait()
+	return ctx.Err()
 }
 
-// watchOnce runs one wl-paste watcher until it exits.
-func (w *wayland) watchOnce(ctx context.Context, onText func(string)) error {
+// watchOnce runs one wl-paste watcher for typ until it exits.
+func (w *wayland) watchOnce(ctx context.Context, typ string, onCopy func(Content)) error {
 	// wl-paste announces the existing content as its first event. Remember
 	// what that is so it is not mistaken for a fresh copy.
-	startup, _ := w.Read(ctx)
+	startup, _ := w.readType(ctx, typ)
 
 	cmd := exec.CommandContext(ctx, "wl-paste",
-		w.args("--type", textType, "--watch", "sh", "-c", watchScript)...)
+		w.args("--type", typ, "--watch", "sh", "-c", watchScript)...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	cmd.WaitDelay = 2 * time.Second
@@ -137,7 +172,7 @@ func (w *wayland) watchOnce(ctx context.Context, onText func(string)) error {
 		if err != nil {
 			break
 		}
-		text, ok, err := parseWatchLine(line)
+		data, ok, err := parseWatchLine(line)
 		if err != nil {
 			fatal = err
 			cmd.Process.Kill()
@@ -145,12 +180,15 @@ func (w *wayland) watchOnce(ctx context.Context, onText func(string)) error {
 		}
 		if first {
 			first = false
-			if text == startup {
+			if data == startup {
 				continue
 			}
 		}
-		if ok {
-			onText(text)
+		if !ok {
+			continue
+		}
+		if c, ok := w.content(ctx, typ, data); ok {
+			onCopy(c)
 		}
 	}
 	err = cmd.Wait()
@@ -163,9 +201,23 @@ func (w *wayland) watchOnce(ctx context.Context, onText func(string)) error {
 	return fmt.Errorf("wl-paste exited: %v", err)
 }
 
+// content turns what a watcher for typ was handed into what was copied. ok is
+// false when this watcher is not the one to report it.
+func (w *wayland) content(ctx context.Context, typ, data string) (c Content, ok bool) {
+	if typ == filesType {
+		files := parseURIList(data)
+		return Content{Files: files}, len(files) > 0
+	}
+	// A copy of files is offered as text too, and comes from the other watcher.
+	if len(w.readFiles(ctx)) > 0 {
+		return Content{}, false
+	}
+	return Content{Text: data}, true
+}
+
 // parseWatchLine decodes one line printed by watchScript. ok is false for
 // content that must not be synced.
-func parseWatchLine(line string) (text string, ok bool, err error) {
+func parseWatchLine(line string) (data string, ok bool, err error) {
 	state, encoded, found := strings.Cut(strings.TrimSuffix(line, "\n"), " ")
 	if !found {
 		return "", false, fmt.Errorf("unexpected clipboard watcher output %q", line)
@@ -183,6 +235,6 @@ func parseWatchLine(line string) (text string, ok bool, err error) {
 	if err != nil {
 		return "", false, fmt.Errorf("clipboard watcher output is not base64: %w", err)
 	}
-	text = string(raw)
-	return text, syncable(text), nil
+	data = string(raw)
+	return data, syncable(data), nil
 }

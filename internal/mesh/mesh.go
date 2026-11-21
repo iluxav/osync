@@ -1,5 +1,6 @@
 // Package mesh keeps one WebSocket open to every peer on the tailnet and
-// carries messages between them.
+// carries messages between them, along with streams: large payloads that
+// travel in pieces between the messages.
 //
 // Every machine listens on its Tailscale addresses only. For each pair of
 // machines exactly one side dials: the one whose node ID sorts first.
@@ -9,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -36,18 +38,46 @@ const (
 	pingInterval     = 15 * time.Second
 	pingTimeout      = 10 * time.Second
 	readLimit        = 32 << 20
+	// The size of one piece of a stream. A piece has to get through within
+	// writeTimeout on the slowest link worth using, and a message waits for
+	// at most one piece.
+	pieceSize = 64 << 10
 )
 
 // Config configures a Mesh.
 type Config struct {
 	Port    int
 	Tailnet tailnet.Source
-	// Receive is called with every message a peer sends. Calls for one peer
-	// are sequential; calls for different peers may overlap.
-	Receive func(from tailnet.Node, payload []byte)
+	// Connect is called for every connection made to a peer, and returns
+	// what receives from it. Connections to different peers call their
+	// handlers at the same time.
+	Connect func(peer tailnet.Node) Handler
 	Log     *slog.Logger
 	// Poll is how often the tailnet state is re-read. Zero means 5 seconds.
 	Poll time.Duration
+}
+
+// Handler receives what one connection delivers. Its methods are called one
+// at a time, in the order things arrived.
+type Handler interface {
+	// Message is called with each message the peer sends.
+	Message(payload []byte)
+	// Piece is called with each piece of a stream the peer sends. Pieces
+	// belong to the stream whose Head message came last.
+	Piece(data []byte)
+	// Closed is called once, after the connection has ended.
+	Closed()
+}
+
+// Stream is a large payload for the peers. It is sent in pieces, so that
+// messages keep flowing while it is on its way.
+type Stream struct {
+	Head []byte                        // message sent ahead of the data
+	Open func() (io.ReadCloser, error) // the data; opened once for each peer
+	Tail []byte                        // message sent after the last piece
+	// Abort is the message sent in place of Tail when the data stops short:
+	// reading it failed, or a newer stream took its place.
+	Abort []byte
 }
 
 // Mesh is the set of connections to the other machines.
@@ -78,16 +108,24 @@ type peer struct {
 
 // link is one established connection to a peer.
 type link struct {
-	ws     *websocket.Conn
-	out    chan []byte
-	since  time.Time
-	cancel context.CancelFunc
+	ws  *websocket.Conn
+	out chan []byte
+	// bulk holds the stream to send next, or nil to only abandon the one on
+	// its way. Capacity one: a stream that has not started when a newer one
+	// comes is never sent.
+	bulk    chan *Stream
+	streams bool // the peer takes streams
+	since   time.Time
+	cancel  context.CancelFunc
 }
 
 // hello is the first message each side sends on a new connection.
 type hello struct {
 	Proto int    `json:"proto"`
 	Node  string `json:"node"`
+	// Streams says that this build takes streams. Builds from before streams
+	// existed leave it out, and are sent messages only.
+	Streams bool `json:"streams,omitempty"`
 }
 
 // New returns a Mesh. It does nothing until Run is called.
@@ -221,7 +259,7 @@ func (m *Mesh) dropAllLocked() {
 
 // dial connects to n and records the outcome.
 func (m *Mesh) dial(self, n tailnet.Node) {
-	ws, err := m.connect(self, n)
+	ws, theirs, err := m.connect(self, n)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -244,17 +282,17 @@ func (m *Mesh) dial(self, n tailnet.Node) {
 		m.cfg.Log.Debug("dial failed", "peer", n.Name, "err", err)
 		return
 	}
-	m.attachLocked(p, ws)
+	m.attachLocked(p, ws, theirs)
 }
 
-func (m *Mesh) connect(self, n tailnet.Node) (*websocket.Conn, error) {
+func (m *Mesh) connect(self, n tailnet.Node) (*websocket.Conn, hello, error) {
 	to, ok := n.Addr()
 	if !ok {
-		return nil, errors.New("peer has no address")
+		return nil, hello{}, errors.New("peer has no address")
 	}
 	from, ok := self.AddrLike(to)
 	if !ok {
-		return nil, fmt.Errorf("no local Tailscale address to reach %s from", to)
+		return nil, hello{}, fmt.Errorf("no local Tailscale address to reach %s from", to)
 	}
 	ctx, cancel := context.WithTimeout(m.runCtx, dialTimeout)
 	defer cancel()
@@ -270,13 +308,14 @@ func (m *Mesh) connect(self, n tailnet.Node) (*websocket.Conn, error) {
 	url := "ws://" + netip.AddrPortFrom(to, uint16(m.cfg.Port)).String() + "/ws"
 	ws, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{HTTPClient: &http.Client{Transport: transport}})
 	if err != nil {
-		return nil, err
+		return nil, hello{}, err
 	}
-	if err := handshake(ctx, ws, self.ID, n.ID); err != nil {
+	theirs, err := handshake(ctx, ws, self.ID, n.ID)
+	if err != nil {
 		ws.CloseNow()
-		return nil, err
+		return nil, hello{}, err
 	}
-	return ws, nil
+	return ws, theirs, nil
 }
 
 // accept handles a peer dialing in.
@@ -309,7 +348,8 @@ func (m *Mesh) accept(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	if err := handshake(r.Context(), ws, self.ID, n.ID); err != nil {
+	theirs, err := handshake(r.Context(), ws, self.ID, n.ID)
+	if err != nil {
 		m.cfg.Log.Warn("handshake failed", "peer", n.Name, "err", err)
 		ws.CloseNow()
 		return
@@ -322,7 +362,7 @@ func (m *Mesh) accept(w http.ResponseWriter, r *http.Request) {
 		ws.CloseNow()
 		return
 	}
-	m.attachLocked(p, ws)
+	m.attachLocked(p, ws, theirs)
 }
 
 func (m *Mesh) peerAtLocked(addr netip.Addr) (tailnet.Node, bool) {
@@ -334,34 +374,38 @@ func (m *Mesh) peerAtLocked(addr netip.Addr) (tailnet.Node, bool) {
 	return tailnet.Node{}, false
 }
 
-// handshake swaps hellos and checks the other side is who it should be.
-func handshake(ctx context.Context, ws *websocket.Conn, selfID, peerID string) error {
+// handshake swaps hellos, checks the other side is who it should be, and
+// returns what it said.
+func handshake(ctx context.Context, ws *websocket.Conn, selfID, peerID string) (hello, error) {
 	ctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancel()
-	if err := wsjson.Write(ctx, ws, hello{Proto: protoVersion, Node: selfID}); err != nil {
-		return err
+	if err := wsjson.Write(ctx, ws, hello{Proto: protoVersion, Node: selfID, Streams: true}); err != nil {
+		return hello{}, err
 	}
 	var h hello
 	if err := wsjson.Read(ctx, ws, &h); err != nil {
-		return err
+		return hello{}, err
 	}
 	if h.Proto != protoVersion {
-		return fmt.Errorf("peer speaks protocol %d and this build speaks %d: update both machines", h.Proto, protoVersion)
+		return hello{}, fmt.Errorf("peer speaks protocol %d and this build speaks %d: update both machines", h.Proto, protoVersion)
 	}
 	if h.Node != peerID {
-		return fmt.Errorf("expected node %s, got %s", peerID, h.Node)
+		return hello{}, fmt.Errorf("expected node %s, got %s", peerID, h.Node)
 	}
-	return nil
+	return h, nil
 }
 
 // attachLocked makes ws the connection to p, replacing any earlier one.
-func (m *Mesh) attachLocked(p *peer, ws *websocket.Conn) {
+func (m *Mesh) attachLocked(p *peer, ws *websocket.Conn, theirs hello) {
 	if p.link != nil {
 		// The peer reconnected before the old connection was noticed dead.
 		p.link.cancel()
 	}
 	ctx, cancel := context.WithCancel(m.runCtx)
-	l := &link{ws: ws, out: make(chan []byte, 32), since: time.Now(), cancel: cancel}
+	l := &link{
+		ws: ws, out: make(chan []byte, 32), bulk: make(chan *Stream, 1), streams: theirs.Streams,
+		since: time.Now(), cancel: cancel,
+	}
 	ws.SetReadLimit(readLimit)
 	p.link, p.lastErr, p.backoff, p.retryAt = l, "", 0, time.Time{}
 	node := p.node
@@ -371,13 +415,15 @@ func (m *Mesh) attachLocked(p *peer, ws *websocket.Conn) {
 
 // runLink pumps one connection until it fails or is cancelled.
 func (m *Mesh) runLink(ctx context.Context, node tailnet.Node, l *link) {
+	h := m.cfg.Connect(node)
 	errs := make(chan error, 2)
-	go func() { errs <- m.readLoop(ctx, node, l) }()
-	go func() { errs <- writeLoop(ctx, l) }()
+	go func() { errs <- readLoop(ctx, h, l) }()
+	go func() { errs <- m.writeLoop(ctx, node, l) }()
 	err := <-errs
 	l.cancel()
 	l.ws.CloseNow()
 	<-errs
+	h.Closed()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -388,30 +434,67 @@ func (m *Mesh) runLink(ctx context.Context, node tailnet.Node, l *link) {
 	}
 }
 
-func (m *Mesh) readLoop(ctx context.Context, node tailnet.Node, l *link) error {
+func readLoop(ctx context.Context, h Handler, l *link) error {
 	for {
 		typ, data, err := l.ws.Read(ctx)
 		if err != nil {
 			return err
 		}
+		// Messages are text frames and pieces of a stream binary ones.
 		if typ == websocket.MessageText {
-			m.cfg.Receive(node, data)
+			h.Message(data)
+		} else {
+			h.Piece(data)
 		}
 	}
 }
 
-func writeLoop(ctx context.Context, l *link) error {
+func (m *Mesh) writeLoop(ctx context.Context, node tailnet.Node, l *link) error {
 	ping := time.NewTicker(pingInterval)
 	defer ping.Stop()
+	write := func(typ websocket.MessageType, payload []byte) error {
+		wctx, cancel := context.WithTimeout(ctx, writeTimeout)
+		defer cancel()
+		return l.ws.Write(wctx, typ, payload)
+	}
+
+	// The stream being sent, if any, and how far it has got.
+	var (
+		cur  *Stream
+		data io.ReadCloser
+	)
+	defer func() {
+		if data != nil {
+			data.Close()
+		}
+	}()
+	// end closes the current stream and tells the peer how it ended.
+	end := func(whole bool) error {
+		data.Close()
+		closing := cur.Abort
+		if whole {
+			closing = cur.Tail
+		}
+		cur, data = nil, nil
+		return write(websocket.MessageText, closing)
+	}
+	// more is ready whenever a stream has pieces left. It sits in the select
+	// beside everything else, so a message or a ping waits for one piece at
+	// most, never for the whole stream.
+	ready := make(chan struct{})
+	close(ready)
+	piece := make([]byte, pieceSize)
+
 	for {
+		var more chan struct{}
+		if cur != nil {
+			more = ready
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case payload := <-l.out:
-			wctx, cancel := context.WithTimeout(ctx, writeTimeout)
-			err := l.ws.Write(wctx, websocket.MessageText, payload)
-			cancel()
-			if err != nil {
+			if err := write(websocket.MessageText, payload); err != nil {
 				return err
 			}
 		case <-ping.C:
@@ -422,6 +505,43 @@ func writeLoop(ctx context.Context, l *link) error {
 			cancel()
 			if err != nil {
 				return fmt.Errorf("ping: %w", err)
+			}
+		case next := <-l.bulk:
+			if cur != nil {
+				if err := end(false); err != nil {
+					return err
+				}
+			}
+			if next == nil {
+				continue
+			}
+			r, err := next.Open()
+			if err != nil {
+				m.cfg.Log.Warn("stream not sent", "peer", node.Name, "err", err)
+				continue
+			}
+			cur, data = next, r
+			if err := write(websocket.MessageText, next.Head); err != nil {
+				return err
+			}
+		case <-more:
+			n, err := io.ReadFull(data, piece)
+			if n > 0 {
+				if err := write(websocket.MessageBinary, piece[:n]); err != nil {
+					return err
+				}
+			}
+			switch {
+			case err == nil:
+			case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+				if err := end(true); err != nil {
+					return err
+				}
+			default:
+				m.cfg.Log.Warn("stream cut short", "peer", node.Name, "err", err)
+				if err := end(false); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -443,6 +563,30 @@ func (m *Mesh) Broadcast(payload []byte) {
 			p.link.cancel()
 		}
 	}
+}
+
+// Stream starts sending s to every connected peer that takes streams, and
+// returns how many that is. A stream still on its way is abandoned for it.
+// A nil s only abandons.
+func (m *Mesh) Stream(s *Stream) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sent := 0
+	for _, p := range m.peers {
+		l := p.link
+		if l == nil || !l.streams {
+			continue
+		}
+		// Take back one that has not started. With m.mu held nothing else
+		// puts streams in, so the slot is then free.
+		select {
+		case <-l.bulk:
+		default:
+		}
+		l.bulk <- s
+		sent++
+	}
+	return sent
 }
 
 // PeerStatus describes one peer for display.

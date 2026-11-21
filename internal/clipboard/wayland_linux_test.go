@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -64,7 +66,7 @@ func TestWaylandSession(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
-	// Put back what the user had selected, as far as text goes.
+	// Put back what the user had selected, as far as text and files go.
 	if before, err := w.Read(ctx); err == nil {
 		defer w.Write(context.Background(), before)
 	}
@@ -80,15 +82,26 @@ func TestWaylandSession(t *testing.T) {
 	}
 
 	userCopy("there before the watcher started", "--type", "text/plain")
-	reports := make(chan string, 16)
-	go w.Watch(ctx, func(text string) { reports <- text })
+	reports := make(chan Content, 16)
+	go w.Watch(ctx, func(c Content) { reports <- c })
 
 	expect := func(what, want string) {
 		t.Helper()
 		select {
-		case got := <-reports:
-			if got != want {
-				t.Fatalf("%s: reported %d bytes %.40q, want %d bytes %.40q", what, len(got), got, len(want), want)
+		case c := <-reports:
+			if got := c.Text; got != want || c.Files != nil {
+				t.Fatalf("%s: reported %d bytes %.40q and files %q, want %d bytes %.40q", what, len(got), got, c.Files, len(want), want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: nothing reported", what)
+		}
+	}
+	expectFiles := func(what string, want ...string) {
+		t.Helper()
+		select {
+		case c := <-reports:
+			if c.Text != "" || !slices.Equal(c.Files, want) {
+				t.Fatalf("%s: reported text %.40q and files %q, want files %q", what, c.Text, c.Files, want)
 			}
 		case <-time.After(5 * time.Second):
 			t.Fatalf("%s: nothing reported", what)
@@ -97,8 +110,8 @@ func TestWaylandSession(t *testing.T) {
 	expectNothing := func(what string) {
 		t.Helper()
 		select {
-		case got := <-reports:
-			t.Fatalf("%s: reported %d bytes %.40q, want nothing", what, len(got), got)
+		case c := <-reports:
+			t.Fatalf("%s: reported %d bytes %.40q and files %q, want nothing", what, len(c.Text), c.Text, c.Files)
 		case <-time.After(700 * time.Millisecond):
 		}
 	}
@@ -128,15 +141,47 @@ func TestWaylandSession(t *testing.T) {
 	// What the daemon writes can be read back unchanged, pastes as plain
 	// text, and is reported like any other copy.
 	written := "written by the daemon ✓\n"
-	if err := w.Write(ctx, written); err != nil {
+	if err := w.Write(ctx, Content{Text: written}); err != nil {
 		t.Fatal(err)
 	}
 	expect("our own write", written)
-	if got, err := w.Read(ctx); err != nil || got != written {
-		t.Errorf("Read = %q, %v; want %q", got, err, written)
+	if got, err := w.Read(ctx); err != nil || got.Text != written || got.Files != nil {
+		t.Errorf("Read = %+v, %v; want the text %q", got, err, written)
 	}
 	types, err := exec.Command("wl-paste", "--primary", "--list-types").Output()
 	if err != nil || !strings.Contains(string(types), textType) {
 		t.Errorf("types offered after Write = %q, %v; want %s among them", types, err, textType)
 	}
+
+	// Files, the way a file manager copies them. It offers them as text as
+	// well; the copy must be reported once, as files.
+	dir := t.TempDir()
+	one, two := filepath.Join(dir, "one file.txt"), filepath.Join(dir, "ünïcödé ✓")
+	userCopy(uriList([]string{one, two}), "--type", filesType)
+	expectFiles("files copied in a file manager", one, two)
+	expectNothing("the text form of copied files")
+	if got, err := w.Read(ctx); err != nil || got.Text != "" || !slices.Equal(got.Files, []string{one, two}) {
+		t.Errorf("Read = %+v, %v; want the two files", got, err)
+	}
+
+	userCopy("https://example.com/a\r\nhttps://example.com/b\r\n", "--type", filesType)
+	expect("links are text, not files", "https://example.com/a\r\nhttps://example.com/b\r\n")
+
+	// Files the daemon writes can be read back, are reported like any other
+	// copy, and are offered the way file managers look for them.
+	if err := w.Write(ctx, Content{Files: []string{two, one}}); err != nil {
+		t.Fatal(err)
+	}
+	expectFiles("our own write of files", two, one)
+	expectNothing("the text form of written files")
+	if got, err := w.Read(ctx); err != nil || !slices.Equal(got.Files, []string{two, one}) {
+		t.Errorf("Read = %+v, %v; want the files that were written", got, err)
+	}
+	types, err = exec.Command("wl-paste", "--primary", "--list-types").Output()
+	if err != nil || !slices.Contains(strings.Fields(string(types)), filesType) {
+		t.Errorf("types offered after writing files = %q, %v; want %s among them", types, err, filesType)
+	}
+
+	userCopy("text again", "--type", "text/plain")
+	expect("text after files", "text again")
 }
