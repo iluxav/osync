@@ -17,6 +17,11 @@ REPO=iluxav/osync
 PORT=24817
 BIN_DIR="$HOME/.local/bin"
 BIN="$BIN_DIR/osync"
+# Where macOS gets a link to the binary; see link_command.
+LINK_DIR=/usr/local/bin
+# What to type to run osync. link_command changes it when `osync` alone will
+# not be found.
+CMD=osync
 # The directory this script sits in. Empty when it is piped into bash.
 HERE=""
 if [[ -n ${BASH_SOURCE[0]:-} && -f ${BASH_SOURCE[0]} ]]; then
@@ -146,6 +151,35 @@ install_binary() {
   echo "installed osync $("$BIN" version)"
 }
 
+on_path() {
+  case ":$PATH:" in
+    *":$1:"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Makes `osync` a command in the terminal. macOS shells leave ~/.local/bin off
+# PATH but include /usr/local/bin, which is where Tailscale links its own
+# client. The binary stays in ~/.local/bin so that upgrades need no password.
+link_command() {
+  if on_path "$BIN_DIR"; then
+    return
+  fi
+  local link="$LINK_DIR/osync"
+  if [[ $os == darwin ]] && on_path "$LINK_DIR"; then
+    if [[ "$(readlink "$link" 2>/dev/null)" == "$BIN" ]]; then
+      return
+    fi
+    say "Linking $link, so that osync works as a command (this can ask for your password)"
+    if [[ -w $LINK_DIR ]]; then
+      ln -sf "$BIN" "$link" && return
+    elif sudo mkdir -p "$LINK_DIR" && sudo ln -sf "$BIN" "$link"; then
+      return
+    fi
+  fi
+  CMD="$BIN"
+}
+
 # Omarchy ships ufw denying all incoming connections, including those that
 # arrive over Tailscale. Peers reach the daemon on tailscale0 only.
 open_firewall() {
@@ -221,6 +255,7 @@ main() {
   connect_tailscale
   install_clipboard_tools
   install_binary
+  link_command
   open_firewall
   if [[ $os == linux ]]; then
     install_service_linux
@@ -231,11 +266,7 @@ main() {
   say "Installed"
   sleep 2 # give the daemon a moment to find Tailscale and its peers
   "$BIN" status || true
-  printf '\nRun this on your other machines too. Check on it any time with: osync status\n'
-  case ":$PATH:" in
-    *":$BIN_DIR:"*) ;;
-    *) printf 'Note: %s is not on your PATH, so call it as %s\n' "$BIN_DIR" "$BIN" ;;
-  esac
+  printf '\nRun this on your other machines too. Check on it any time with: %s status\n' "$CMD"
 }
 
 # This stays the last line: piped into bash, the whole script must be read

@@ -14,7 +14,8 @@ curl -fsSL https://raw.githubusercontent.com/iluxav/osync/main/install.sh | bash
 
 The script installs Tailscale if it is missing (on macOS, install the
 Tailscale app and sign in first), downloads the binary for the machine's OS
-and CPU to `~/.local/bin/osync`, and starts it as a per-user service. Run it
+and CPU to `~/.local/bin/osync` (linked from `/usr/local/bin` on macOS, so
+`osync` works as a command), and starts it as a per-user service. Run it
 again to upgrade.
 
 All machines must be signed in to Tailscale with the same account.
