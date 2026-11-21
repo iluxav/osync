@@ -3,6 +3,7 @@
 package clipboard
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"net/url"
@@ -21,24 +22,42 @@ const toolTimeout = 5 * time.Second
 // MaxBytes is the largest text that is synced.
 const MaxBytes = 4 << 20
 
-// Content is what a clipboard holds: text, or files copied in a file manager.
+// MaxImageBytes is the largest picture that is synced. A screenshot of a 5K
+// display full of photographs stays under it.
+const MaxImageBytes = 32 << 20
+
+// Content is what a clipboard holds, which is one of three things: text,
+// files copied in a file manager, or a picture.
+//
+// A copy is often offered in several forms at once, and then it is the
+// first of these that it has: a file manager offers the paths of copied
+// files as text, and a spreadsheet offers a picture of copied cells next to
+// their content.
 type Content struct {
 	Text string
-	// Files are the absolute paths of the copied files and folders. Content
-	// with files has no text: a file manager also offers the paths as text,
-	// and that text is left out so the copy is one thing, not two.
+	// Files are the absolute paths of the copied files and folders.
 	Files []string
+	// Image is a picture that is on the clipboard as data and not as a file,
+	// such as a screenshot. It is a PNG.
+	Image []byte
 }
 
 // Equal reports whether c and o hold the same thing.
 func (c Content) Equal(o Content) bool {
-	return c.Text == o.Text && slices.Equal(c.Files, o.Files)
+	return c.Text == o.Text && slices.Equal(c.Files, o.Files) && bytes.Equal(c.Image, o.Image)
+}
+
+// ValidImage reports whether data is a picture that may be synced: a PNG of
+// no more than MaxImageBytes. Only the signature is looked at; whether the
+// rest makes a picture is for the program it is pasted into.
+func ValidImage(data []byte) bool {
+	return len(data) <= MaxImageBytes && bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n"))
 }
 
 // Clipboard is the system clipboard, reduced to what sync needs.
 type Clipboard interface {
 	// Read returns what is on the clipboard right now. It fails when the
-	// clipboard holds neither text nor files.
+	// clipboard holds none of the three things Content can be.
 	Read(ctx context.Context) (Content, error)
 
 	// Write replaces the clipboard content with c.
@@ -48,8 +67,8 @@ type Clipboard interface {
 	// be synced lands on the clipboard, until ctx is done. Calls do not
 	// overlap. It never reports the content that was already there when it
 	// started, nor content that must stay on this machine: anything a
-	// password manager marked as concealed, content that is neither text nor
-	// files, and text larger than MaxBytes.
+	// password manager marked as concealed, content that is neither text,
+	// files nor a picture, and text or pictures over their size limits.
 	//
 	// Content placed by Write is reported like any other.
 	Watch(ctx context.Context, onCopy func(Content)) error

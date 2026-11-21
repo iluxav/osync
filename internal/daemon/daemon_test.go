@@ -1,10 +1,14 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"image"
+	"image/png"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +16,7 @@ import (
 	"time"
 
 	"github.com/iluxav/osync/internal/bundle"
+	"github.com/iluxav/osync/internal/clipboard"
 	"github.com/iluxav/osync/internal/clipboard/clipboardtest"
 	"github.com/iluxav/osync/internal/tailnet"
 	"github.com/iluxav/osync/internal/tailnet/tailnettest"
@@ -417,5 +422,107 @@ func TestFilesCopiedOutOfTheInboxAreNotSentBack(t *testing.T) {
 	}
 	if a.board.Writes() != 0 {
 		t.Errorf("a's clipboard was written %d times, want 0", a.board.Writes())
+	}
+}
+
+// screenshot returns a PNG of noise, which does not compress: side*side*4
+// bytes and a little more.
+func screenshot(t *testing.T, side int, seed uint64) []byte {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, side, side))
+	rng := rand.New(rand.NewPCG(seed, seed))
+	for i := range img.Pix {
+		img.Pix[i] = byte(rng.Uint32())
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestScreenshotCanBePastedOnEveryMachine(t *testing.T) {
+	ms := startMachines(t, 3)
+	a, b, c := ms[0], ms[1], ms[2]
+	shot := screenshot(t, 400, 1) // well over one piece of a stream
+
+	a.board.CopyImage(shot)
+	eventually(t, "b and c to hold the screenshot", func() bool {
+		return bytes.Equal(b.board.Image(), shot) && bytes.Equal(c.board.Image(), shot)
+	})
+	if _, err := png.Decode(bytes.NewReader(b.board.Image())); err != nil {
+		t.Errorf("what b holds does not open as a picture: %v", err)
+	}
+	if b.board.Text() != "" || len(b.board.Files()) != 0 {
+		t.Errorf("b also holds text %q and files %q", b.board.Text(), b.board.Files())
+	}
+
+	// No ping-pong: one clip sent, each receiver wrote it once.
+	time.Sleep(200 * time.Millisecond)
+	if a.board.Writes() != 0 || b.board.Writes() != 1 || c.board.Writes() != 1 {
+		t.Errorf("writes a/b/c = %d/%d/%d, want 0/1/1", a.board.Writes(), b.board.Writes(), c.board.Writes())
+	}
+	sa, sb, sc := status(t, a).Clipboard, status(t, b).Clipboard, status(t, c).Clipboard
+	if sa.Sent != 1 || sb.Sent != 0 || sc.Sent != 0 || sb.Received != 1 || sc.Received != 1 {
+		t.Errorf("sent a/b/c = %d/%d/%d, received b/c = %d/%d; want 1/0/0 and 1/1", sa.Sent, sb.Sent, sc.Sent, sb.Received, sc.Received)
+	}
+}
+
+func TestOneScreenshotAfterAnother(t *testing.T) {
+	ms := startMachines(t, 2)
+	a, b := ms[0], ms[1]
+	for i := range 6 {
+		// Back and forth, each machine taking a turn.
+		from, to := a, b
+		if i%2 == 1 {
+			from, to = b, a
+		}
+		shot := screenshot(t, 120, uint64(i+10))
+		from.board.CopyImage(shot)
+		eventually(t, fmt.Sprintf("screenshot %d to arrive on %s", i, to.name), func() bool {
+			return bytes.Equal(to.board.Image(), shot)
+		})
+	}
+}
+
+func TestScreenshotTextAndFilesReplaceEachOther(t *testing.T) {
+	ms := startMachines(t, 2)
+	a, b := ms[0], ms[1]
+	shot := screenshot(t, 100, 2)
+
+	a.board.Copy("text first")
+	eventually(t, "b to hold the text", func() bool { return b.board.Text() == "text first" })
+	a.board.CopyImage(shot)
+	eventually(t, "b to hold the screenshot and no text", func() bool {
+		return bytes.Equal(b.board.Image(), shot) && b.board.Text() == ""
+	})
+	b.board.CopyFiles(write(t, t.TempDir(), "doc.txt", "a file\n"))
+	eventually(t, "a to hold the file and no picture", func() bool { return holds(a, "doc.txt") && a.board.Image() == nil })
+	a.board.Copy("text last")
+	eventually(t, "b to hold the text and nothing else", func() bool {
+		return b.board.Text() == "text last" && b.board.Image() == nil && len(b.board.Files()) == 0
+	})
+}
+
+func TestTextCopiedRightAfterALargeScreenshotWins(t *testing.T) {
+	ms := startMachines(t, 3)
+	a := ms[0]
+	big := screenshot(t, 1500, 3) // 9 MB
+	if len(big) < 8<<20 || !clipboard.ValidImage(big) {
+		t.Fatalf("the test picture is %d bytes", len(big))
+	}
+	for i := range 3 {
+		a.board.CopyImage(big)
+		text := fmt.Sprintf("text %d", i)
+		a.board.Copy(text)
+		for _, mc := range ms {
+			eventually(t, mc.name+" to hold the text", func() bool { return mc.board.Text() == text })
+		}
+		time.Sleep(50 * time.Millisecond)
+		for _, mc := range ms {
+			if mc.board.Text() != text || mc.board.Image() != nil {
+				t.Fatalf("%s ended with text %q and a picture of %d bytes, want %q", mc.name, mc.board.Text(), len(mc.board.Image()), text)
+			}
+		}
 	}
 }

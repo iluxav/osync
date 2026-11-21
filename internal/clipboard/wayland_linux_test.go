@@ -37,7 +37,7 @@ func TestParseWatchLine(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			text, ok, err := parseWatchLine(tt.line)
+			text, ok, err := parseWatchLine(tt.line, syncable)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -47,10 +47,10 @@ func TestParseWatchLine(t *testing.T) {
 		})
 	}
 
-	if _, _, err := parseWatchLine("unknown " + b64("x") + "\n"); !errors.Is(err, errTooOld) {
+	if _, _, err := parseWatchLine("unknown "+b64("x")+"\n", syncable); !errors.Is(err, errTooOld) {
 		t.Errorf("wl-clipboard without CLIPBOARD_STATE: err = %v, want errTooOld", err)
 	}
-	if _, _, err := parseWatchLine("garbage\n"); err == nil {
+	if _, _, err := parseWatchLine("garbage\n", syncable); err == nil {
 		t.Error("line without a state: want an error")
 	}
 }
@@ -128,8 +128,8 @@ func TestWaylandSession(t *testing.T) {
 	userCopy("hunter2", "--sensitive", "--type", "text/plain")
 	expectNothing("a password manager's copy")
 
-	userCopy("\x89PNG\r\n\x1a\n not really an image", "--type", "image/png")
-	expectNothing("an image")
+	userCopy("\xff\xd8\xff\xe0 a JPEG", "--type", "image/jpeg")
+	expectNothing("a picture in a form that is not synced")
 
 	big := strings.Repeat("0123456789abcdef", 1<<16) // 1 MiB
 	userCopy(big, "--type", "text/plain")
@@ -184,4 +184,47 @@ func TestWaylandSession(t *testing.T) {
 
 	userCopy("text again", "--type", "text/plain")
 	expect("text after files", "text again")
+
+	// A screenshot: a picture and nothing else.
+	shot := "\x89PNG\r\n\x1a\n" + strings.Repeat("\x00\xff pixels \n", 5000)
+	expectImage := func(what, want string) {
+		t.Helper()
+		select {
+		case c := <-reports:
+			if c.Text != "" || c.Files != nil || string(c.Image) != want {
+				t.Fatalf("%s: reported text %.40q, files %q and a picture of %d bytes; want only a picture of %d bytes", what, c.Text, c.Files, len(c.Image), len(want))
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: nothing reported", what)
+		}
+	}
+	userCopy(shot, "--type", imageType)
+	expectImage("a screenshot", shot)
+	if got, err := w.Read(ctx); err != nil || string(got.Image) != shot || got.Text != "" {
+		t.Errorf("Read = text %.40q and a picture of %d bytes, %v; want the screenshot", got.Text, len(got.Image), err)
+	}
+	// The same screenshot taken again is a new copy, and is reported again.
+	userCopy(shot, "--type", imageType)
+	expectImage("the same picture copied again", shot)
+
+	userCopy("\xff\xd8\xff\xe0 a JPEG under the wrong name", "--type", imageType)
+	expectNothing("a picture that is not a PNG")
+
+	// A picture the daemon writes is reported, read back unchanged, and
+	// offered as a picture.
+	other := "\x89PNG\r\n\x1a\n" + strings.Repeat("other pixels", 300)
+	if err := w.Write(ctx, Content{Image: []byte(other)}); err != nil {
+		t.Fatal(err)
+	}
+	expectImage("our own write of a picture", other)
+	if got, err := w.Read(ctx); err != nil || string(got.Image) != other {
+		t.Errorf("Read = a picture of %d bytes, %v; want the one that was written", len(got.Image), err)
+	}
+	types, err = exec.Command("wl-paste", "--primary", "--list-types").Output()
+	if err != nil || strings.TrimSpace(string(types)) != imageType {
+		t.Errorf("types offered after writing a picture = %q, %v; want only %s", types, err, imageType)
+	}
+
+	userCopy("text after a picture", "--type", "text/plain")
+	expect("text after a picture", "text after a picture")
 }

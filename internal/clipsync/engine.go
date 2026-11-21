@@ -1,6 +1,6 @@
 // Package clipsync decides which clipboard content wins. It turns local copies
 // into clips for other machines and applies the clips they send. A copy is
-// text or files; the rules are the same for both.
+// text, files or a picture; the rules are the same for all three.
 package clipsync
 
 import (
@@ -31,8 +31,9 @@ type Clip struct {
 	// Origin identifies the daemon that produced the clip. It breaks ties
 	// between clips with equal stamps and has no other meaning.
 	Origin string `json:"origin"`
-	// Text is the copied text. A clip of files has none: the files travel
-	// beside the clip, and reach the engine through RemoteFiles.
+	// Text is the copied text. A clip of files or of a picture has none:
+	// those travel beside the clip, and reach the engine through RemoteFiles
+	// and RemoteImage.
 	Text string `json:"text,omitempty"`
 }
 
@@ -83,14 +84,19 @@ func (e *Engine) Run(ctx context.Context) error {
 // hashOf identifies content. Files are identified by their paths: the same
 // files copied again are the same content, whatever was done to them since.
 func hashOf(c clipboard.Content) [32]byte {
-	if len(c.Files) == 0 {
-		return sha256.Sum256([]byte(c.Text))
-	}
 	h := sha256.New()
-	h.Write([]byte("\x00files"))
-	for _, path := range c.Files {
-		h.Write([]byte{0})
-		h.Write([]byte(path))
+	switch {
+	case len(c.Files) > 0:
+		h.Write([]byte("\x00files"))
+		for _, path := range c.Files {
+			h.Write([]byte{0})
+			h.Write([]byte(path))
+		}
+	case len(c.Image) > 0:
+		h.Write([]byte("\x00image\x00"))
+		h.Write(c.Image)
+	default:
+		h.Write([]byte(c.Text))
 	}
 	return [32]byte(h.Sum(nil))
 }
@@ -131,7 +137,7 @@ func (e *Engine) local(ctx context.Context, content clipboard.Content) {
 	e.adoptLocked(clip, hash, now)
 	e.stats.Sent++
 	e.stats.LastSent = now
-	if len(content.Files) == 0 {
+	if content.Text != "" {
 		e.log.Info("clipboard sent", "bytes", len(content.Text))
 	}
 }
@@ -156,10 +162,19 @@ func (e *Engine) RemoteFiles(ctx context.Context, clip Clip, paths []string) boo
 	return e.remote(ctx, clip, clipboard.Content{Files: paths})
 }
 
-// Expect is told about a clip whose files are only now starting to arrive,
-// and reports whether it would be adopted if they were here already. Hearing
-// of the clip early keeps a copy made on this machine in the meantime ahead
-// of it.
+// RemoteImage handles a clip of a picture sent by another machine, once the
+// picture has arrived. Like Remote, it reports whether the clip was adopted.
+func (e *Engine) RemoteImage(ctx context.Context, clip Clip, png []byte) bool {
+	if !clipboard.ValidImage(png) {
+		return false
+	}
+	return e.remote(ctx, clip, clipboard.Content{Image: png})
+}
+
+// Expect is told about a clip whose files or picture are only now starting
+// to arrive, and reports whether it would be adopted if they were here
+// already. Hearing of the clip early keeps a copy made on this machine in
+// the meantime ahead of it.
 func (e *Engine) Expect(clip Clip) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -189,7 +204,7 @@ func (e *Engine) remote(ctx context.Context, clip Clip, content clipboard.Conten
 		e.log.Error("clipboard write failed", "err", err)
 		return true
 	}
-	if len(content.Files) == 0 {
+	if content.Text != "" {
 		e.log.Info("clipboard received", "bytes", len(content.Text))
 	}
 	return true

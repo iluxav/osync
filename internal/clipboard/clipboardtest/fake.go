@@ -27,6 +27,9 @@ func (f *Fake) Copy(text string) { f.set(clipboard.Content{Text: text}) }
 // CopyFiles acts as the user copying files or folders in a file manager.
 func (f *Fake) CopyFiles(paths ...string) { f.set(clipboard.Content{Files: paths}) }
 
+// CopyImage acts as the user taking a screenshot to the clipboard.
+func (f *Fake) CopyImage(png []byte) { f.set(clipboard.Content{Image: png}) }
+
 func (f *Fake) set(c clipboard.Content) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -42,7 +45,8 @@ func (f *Fake) CopyPrivate(text string) {
 	f.mu.Unlock()
 }
 
-// Text returns the text on the clipboard, which is empty while it holds files.
+// Text returns the text on the clipboard, which is empty while it holds
+// files or a picture.
 func (f *Fake) Text() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -54,6 +58,13 @@ func (f *Fake) Files() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.content.Files
+}
+
+// Image returns the picture on the clipboard.
+func (f *Fake) Image() []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.content.Image
 }
 
 // Writes returns how many times Write was called.

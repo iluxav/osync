@@ -17,20 +17,21 @@ import (
 type board struct {
 	text   string
 	files  []string
-	writes []string // what was written; files as their paths joined by commas
+	image  []byte
+	writes []string // what was written; files as their paths joined by commas, a picture as its bytes
 	fail   bool
 }
 
 func (b *board) Read(context.Context) (clipboard.Content, error) {
-	return clipboard.Content{Text: b.text, Files: b.files}, nil
+	return clipboard.Content{Text: b.text, Files: b.files, Image: b.image}, nil
 }
 
 func (b *board) Write(_ context.Context, c clipboard.Content) error {
 	if b.fail {
 		return errors.New("no display")
 	}
-	b.text, b.files = c.Text, c.Files
-	b.writes = append(b.writes, c.Text+strings.Join(c.Files, ","))
+	b.text, b.files, b.image = c.Text, c.Files, c.Image
+	b.writes = append(b.writes, c.Text+strings.Join(c.Files, ",")+string(c.Image))
 	return nil
 }
 
@@ -70,7 +71,7 @@ func (r *rig) advance(d time.Duration) { r.clock = r.clock.Add(d) }
 // copy acts as the user copying text: it lands on the clipboard and the
 // watcher reports it.
 func (r *rig) copy(text string) {
-	r.board.text, r.board.files = text, nil
+	r.board.text, r.board.files, r.board.image = text, nil, nil
 	r.report(text)
 }
 
@@ -80,9 +81,18 @@ func (r *rig) report(text string) { r.local(ctx, clipboard.Content{Text: text}) 
 
 // copyFiles acts as the user copying files in a file manager.
 func (r *rig) copyFiles(paths ...string) {
-	r.board.text, r.board.files = "", paths
+	r.board.text, r.board.files, r.board.image = "", paths, nil
 	r.reportFiles(paths...)
 }
+
+// copyImage acts as the user taking a screenshot to the clipboard.
+func (r *rig) copyImage(png string) {
+	r.board.text, r.board.files, r.board.image = "", nil, []byte(png)
+	r.local(ctx, clipboard.Content{Image: []byte(png)})
+}
+
+// A PNG as far as its signature goes, which is as far as anything here looks.
+func png(pixels string) string { return "\x89PNG\r\n\x1a\n" + pixels }
 
 func (r *rig) reportFiles(paths ...string) { r.local(ctx, clipboard.Content{Files: paths}) }
 
@@ -351,5 +361,71 @@ func TestTextThatSpellsAPathIsNotMistakenForTheFile(t *testing.T) {
 	r.copy("/inbox/1/a.txt")
 	if len(r.sent) != 1 || r.sent[0].Text != "/inbox/1/a.txt" {
 		t.Errorf("sent = %+v, want the text sent", r.sent)
+	}
+}
+
+func TestScreenshotIsSentAndTheNextOneToo(t *testing.T) {
+	r := newRig("a")
+	r.copyImage(png("first"))
+	if len(r.sent) != 1 || r.sent[0].Text != "" {
+		t.Fatalf("sent = %+v, want one clip without text", r.sent)
+	}
+	// A clipboard manager takes the picture over and announces it again.
+	r.local(ctx, clipboard.Content{Image: []byte(png("first"))})
+	if len(r.sent) != 1 {
+		t.Fatalf("sent %d clips, want 1: the repeat is a duplicate event", len(r.sent))
+	}
+	r.copyImage(png("second"))
+	if len(r.sent) != 2 || !r.sent[1].newerThan(r.sent[0]) {
+		t.Fatalf("sent = %+v, want a second, newer clip for the next screenshot", r.sent)
+	}
+}
+
+func TestReceivedPictureIsWrittenAndItsEchoIsNotSentBack(t *testing.T) {
+	r := newRig("b")
+	if !r.RemoteImage(ctx, Clip{Stamp: 5_000_000, Origin: "a"}, []byte(png("from a"))) {
+		t.Fatal("RemoteImage = false, want the clip adopted")
+	}
+	if len(r.board.writes) != 1 || r.board.writes[0] != png("from a") {
+		t.Fatalf("wrote %d things, want the picture", len(r.board.writes))
+	}
+	r.local(ctx, clipboard.Content{Image: []byte(png("from a"))})
+	r.advance(time.Hour)
+	r.local(ctx, clipboard.Content{Image: []byte(png("from a"))})
+	if len(r.sent) != 0 {
+		t.Errorf("sent = %+v, want nothing: this picture came from a peer", r.sent)
+	}
+}
+
+func TestPictureThatIsNotOneIsDropped(t *testing.T) {
+	r := newRig("b")
+	if r.RemoteImage(ctx, Clip{Stamp: 5_000_000, Origin: "a"}, []byte("#!/bin/sh")) {
+		t.Error("something that is not a PNG was adopted as a picture")
+	}
+	if r.RemoteImage(ctx, Clip{Stamp: 5_000_001, Origin: "a"}, nil) {
+		t.Error("an empty picture was adopted")
+	}
+	if len(r.board.writes) != 0 {
+		t.Errorf("wrote %d things, want none", len(r.board.writes))
+	}
+}
+
+func TestPicturesTextAndFilesReplaceEachOtherInOrder(t *testing.T) {
+	r := newRig("b")
+	r.RemoteImage(ctx, Clip{Stamp: 5_000_000, Origin: "a"}, []byte(png("one")))
+	r.Remote(ctx, Clip{Stamp: 5_000_001, Origin: "a", Text: "two"})
+	r.RemoteImage(ctx, Clip{Stamp: 4_000_000, Origin: "a"}, []byte(png("stale")))
+	r.RemoteFiles(ctx, Clip{Stamp: 5_000_002, Origin: "a"}, []string{"/inbox/1/three.txt"})
+	if want := []string{png("one"), "two", "/inbox/1/three.txt"}; !slices.Equal(r.board.writes, want) {
+		t.Errorf("writes = %q, want %q", r.board.writes, want)
+	}
+}
+
+func TestTextThatSpellsAPictureIsNotMistakenForIt(t *testing.T) {
+	r := newRig("b")
+	r.RemoteImage(ctx, Clip{Stamp: 5_000_000, Origin: "a"}, []byte(png("pixels")))
+	r.copy(png("pixels"))
+	if len(r.sent) != 1 {
+		t.Errorf("sent = %+v, want the text sent: it is a new copy, not an echo", r.sent)
 	}
 }

@@ -54,7 +54,8 @@ type Status struct {
 type message struct {
 	Type string `json:"type"`
 	clipsync.Clip
-	// What the bundle holds, in a "files" message. See fileSync.
+	// What follows a "files" or an "image" message: for files what the
+	// bundle holds, for a picture its size. See fileSync.
 	bundle.Summary
 }
 
@@ -108,8 +109,11 @@ func Run(ctx context.Context, cfg Config) error {
 	})
 	files.mesh = m
 	engine = clipsync.New(cfg.Clipboard, func(clip clipsync.Clip, c clipboard.Content) bool {
-		if len(c.Files) > 0 {
+		switch {
+		case len(c.Files) > 0:
 			return files.send(clip, c.Files)
+		case len(c.Image) > 0:
+			return files.sendImage(clip, c.Image)
 		}
 		payload, err := json.Marshal(message{Type: "clip", Clip: clip})
 		if err != nil {

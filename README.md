@@ -1,7 +1,7 @@
 # osync
 
-Copy on one machine, paste on another: text, files and folders. osync shares
-the clipboard between your own Linux and macOS machines over
+Copy on one machine, paste on another: text, screenshots, files and folders.
+osync shares the clipboard between your own Linux and macOS machines over
 [Tailscale](https://tailscale.com), so they do not need to be on the same
 network.
 
@@ -23,8 +23,8 @@ All machines must be signed in to Tailscale with the same account.
 
 ## Use
 
-Copy text as usual, or copy files in the file manager, and paste on another
-machine. To see what osync is doing:
+Copy text, take a screenshot to the clipboard, or copy files in the file
+manager, and paste on another machine. To see what osync is doing:
 
 ```sh
 osync status
@@ -33,6 +33,8 @@ osync status
 ## What is synced
 
 - Plain text up to 4 MB.
+- Pictures that are on the clipboard as a picture and not as a file: a
+  screenshot, or Copy Image in a browser. Up to 32 MB. They arrive as PNG.
 - Files and folders copied in a file manager (GNOME Files, Finder), up to
   100 MB and 10,000 items per copy. A copy that is over the limit stays on its
   machine, and `osync status` says so.
@@ -46,16 +48,16 @@ cache folder (`~/.cache/osync/files`, or `~/Library/Caches/osync/files` on
 macOS); pasting copies them from there to where you want them. Links inside a
 copied folder are left out.
 
-Files go between machines on version 0.2 or newer. A machine still on 0.1
-gets text only, and `osync status` on the others says that it needs updating.
+A copy that comes in several forms is synced as one of them: files if it has
+files, else text, else a picture. Cells copied in a spreadsheet arrive as
+their text, not as the picture of them that the spreadsheet also offers.
+
+Pictures need version 0.3 on both machines and files 0.2. An older machine
+still gets text.
 
 Linux needs a Wayland compositor with a data-control protocol (Hyprland, Sway,
 KDE) and `wl-clipboard` 2.2 or newer. Files need a file manager that puts them
 on the clipboard as `text/uri-list`, as GNOME Files does.
-
-On macOS, a file is noticed when the clipboard's text changes, which is the
-file's name. Copying a file and then, with nothing in between, another one of
-the same name is not noticed.
 
 ## Develop
 

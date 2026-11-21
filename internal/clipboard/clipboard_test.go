@@ -2,6 +2,7 @@ package clipboard
 
 import (
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -39,5 +40,29 @@ func TestURIListSurvivesARoundTrip(t *testing.T) {
 	paths := []string{"/home/me/plain.txt", "/home/me/with space & ünïcödé ✓.txt", "/home/me/100% #1?.txt", "/home/me/folder"}
 	if got := parseURIList(uriList(paths)); !slices.Equal(got, paths) {
 		t.Errorf("round trip = %q, want %q", got, paths)
+	}
+}
+
+func TestValidImage(t *testing.T) {
+	png := "\x89PNG\r\n\x1a\n"
+	tests := []struct {
+		name string
+		data string
+		want bool
+	}{
+		{"a PNG", png + "the rest of the picture", true},
+		{"the largest allowed", png + strings.Repeat("x", MaxImageBytes-len(png)), true},
+		{"one byte too large", png + strings.Repeat("x", MaxImageBytes-len(png)+1), false},
+		{"a JPEG", "\xff\xd8\xff\xe0 JFIF", false},
+		{"text", "not a picture", false},
+		{"half a signature", "\x89PNG", false},
+		{"nothing", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ValidImage([]byte(tt.data)); got != tt.want {
+				t.Errorf("ValidImage(%d bytes) = %v, want %v", len(tt.data), got, tt.want)
+			}
+		})
 	}
 }
