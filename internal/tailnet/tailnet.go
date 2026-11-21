@@ -103,7 +103,9 @@ func (p *rawPeer) node() Node {
 func Parse(statusJSON []byte) (State, error) {
 	var raw rawStatus
 	if err := json.Unmarshal(statusJSON, &raw); err != nil {
-		return State{}, fmt.Errorf("parse tailscale status: %w", err)
+		// Show what arrived instead: the client prints plain sentences when
+		// it cannot do its job, and those say more than a JSON syntax error.
+		return State{}, fmt.Errorf("parse tailscale status: %w (it printed %q)", err, firstLine(statusJSON))
 	}
 	st := State{Backend: raw.BackendState}
 	if raw.Self == nil {
@@ -179,7 +181,12 @@ func (c *CLI) State(ctx context.Context) (State, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, path, "status", "--json").Output()
+	cmd := exec.CommandContext(ctx, path, "status", "--json")
+	// On macOS the client and the app are one binary, which picks its role
+	// from the terminal variables around it. A launchd agent has none, so
+	// without this the binary acts as the app and prints no status.
+	cmd.Env = append(os.Environ(), "TAILSCALE_BE_CLI=1")
+	out, err := cmd.Output()
 	if err == nil {
 		return Parse(out)
 	}
@@ -195,9 +202,20 @@ func (c *CLI) State(ctx context.Context) (State, error) {
 	}
 	var exit *exec.ExitError
 	if errors.As(err, &exit) {
-		if line, _, _ := strings.Cut(strings.TrimSpace(string(exit.Stderr)), "\n"); line != "" {
+		if line := firstLine(exit.Stderr); line != "" {
 			return State{}, errors.New(line)
 		}
 	}
 	return State{}, fmt.Errorf("tailscale status: %w", err)
+}
+
+// firstLine returns the first line of what a command printed, cut short enough
+// to sit in an error message.
+func firstLine(output []byte) string {
+	line, _, _ := strings.Cut(strings.TrimSpace(string(output)), "\n")
+	line = strings.TrimSpace(line)
+	if r := []rune(line); len(r) > 200 {
+		line = string(r[:200]) + "…"
+	}
+	return line
 }

@@ -83,8 +83,10 @@ func TestParseStoppedAndGarbage(t *testing.T) {
 	if err != nil || st.Running() || st.Backend != "Stopped" {
 		t.Errorf("stopped: st = %+v, err = %v", st, err)
 	}
-	if _, err := Parse([]byte("not json")); err == nil {
-		t.Error("garbage input: want an error")
+	// The error quotes what arrived, which is what a person needs to see.
+	_, err = Parse([]byte("The app said something\nand went on"))
+	if err == nil || !strings.Contains(err.Error(), `"The app said something"`) {
+		t.Errorf("garbage input: err = %v, want one quoting the first line", err)
 	}
 }
 
@@ -110,6 +112,23 @@ func TestCLIReadsStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	if st.Self.Name != "home-desk" || len(st.Peers) != 2 {
+		t.Errorf("state = %+v", st)
+	}
+}
+
+// The macOS binary is the app unless it is told to be the client, and the
+// daemon's launchd environment has none of the terminal variables it looks for.
+func TestCLIAsksTheMacBinaryToBeTheClient(t *testing.T) {
+	fixture := filepath.Join(t.TempDir(), "status.json")
+	if err := os.WriteFile(fixture, []byte(statusJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := fakeCLI(t, `[ "$TAILSCALE_BE_CLI" = 1 ] || { echo "The app opened instead"; exit 0; }; cat '`+fixture+`'`)
+	st, err := c.State(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Self.Name != "home-desk" {
 		t.Errorf("state = %+v", st)
 	}
 }
